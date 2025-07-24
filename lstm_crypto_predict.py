@@ -42,6 +42,7 @@ from tensorflow.keras.callbacks import EarlyStopping
 
 SEQ_LEN = 18         # minutes of history provided to the network
 LOOKAHEAD = 6        # minutes of future to check for all-green candles
+# Acceptable internal column names after standardisation
 FEATURE_COLS = ["open", "high", "low", "close"]
 
 def parse_args() -> argparse.Namespace:
@@ -74,17 +75,80 @@ def _normalise_timestamps(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def load_csv(path: str | Path) -> pd.DataFrame:
+def _load_csv(path: str | Path) -> pd.DataFrame:
     """Read CSV and return cleaned DataFrame with datetime index."""
     df = pd.read_csv(path)
-    df.columns = [c.lower() for c in df.columns]  # make case-insensitive
-    required = set([*FEATURE_COLS, "open_time", "close"])
+    df.columns = [c.lower() for c in df.columns]  # normalise names
+    required = set([*FEATURE_COLS, "open_time"])
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"CSV {path} is missing required columns: {missing}")
+    return df
+
+
+def _load_json(path: str | Path) -> pd.DataFrame:
+    """Load minute candles from JSON file structured as described by the user.
+
+    Expected structure (object of objects):
+        {
+          "<open_ts>": {
+              "x": <close_ts>,  # optional
+              "o": <open>,
+              "h": <high>,
+              "l": <low>,
+              "c": <close>,
+              "v": ...
+          },
+          ...
+        }
+    """
+    import json
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    records = []
+    for open_ts_str, candle in data.items():
+        try:
+            open_ts = int(open_ts_str)
+        except ValueError:
+            # Skip malformed keys
+            continue
+        rec = {
+            "open_time": open_ts,
+            "open": float(candle["o"]),
+            "high": float(candle["h"]),
+            "low": float(candle["l"]),
+            "close": float(candle["c"]),
+            "close_time": candle.get("x", None),
+        }
+        records.append(rec)
+
+    if not records:
+        raise ValueError(f"JSON {path} did not contain any valid candle data")
+
+    df = pd.DataFrame.from_records(records)
+    return df
+
+
+def load_data(path: str | Path) -> pd.DataFrame:
+    """Load candles from CSV or JSON, standardise column names, sort, set index."""
+    path = Path(path)
+    if path.suffix.lower() == ".csv":
+        df = _load_csv(path)
+    elif path.suffix.lower() == ".json":
+        df = _load_json(path)
+    else:
+        raise ValueError(f"Unsupported file extension: {path.suffix}")
+
+    # Normalise and set index
     df = _normalise_timestamps(df)
     df = df.sort_index()
-    # Keep only needed columns for model. (Store original close for plotting later.)
+
+    # Ensure feature columns exist and are float
+    for col in FEATURE_COLS:
+        if col not in df.columns:
+            raise ValueError(f"Column {col} missing after loading {path}")
     df[FEATURE_COLS] = df[FEATURE_COLS].astype(float)
     return df
 
@@ -137,7 +201,7 @@ def build_model(input_shape: Tuple[int, int]) -> Sequential:
 
 
 def train_model(train_csv: str | Path, epochs: int, batch_size: int, model_out: str) -> Tuple[Sequential, StandardScaler, pd.DataFrame]:
-    df_train = load_csv(train_csv)
+    df_train = load_data(train_csv)
     X, y = build_sequences(df_train, SEQ_LEN, LOOKAHEAD)
     # Split further for validation
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, shuffle=False)
@@ -154,9 +218,12 @@ def train_model(train_csv: str | Path, epochs: int, batch_size: int, model_out: 
 
 
 def predict_on_test(model: Sequential, scaler: StandardScaler, test_csv: str | Path, threshold: float, figure_out: str):
-    df_test = load_csv(test_csv)
+    df_test = load_data(test_csv)
     X_test, y_test = build_sequences(df_test, SEQ_LEN, LOOKAHEAD)
     # Scale
+    if X_test.size == 0:
+        print("Warning: No sequences produced for test data. Maybe file too short?")
+        return
     X_test_scaled = scaler.transform(X_test.reshape(-1, len(FEATURE_COLS))).reshape(X_test.shape)
 
     probs = model.predict(X_test_scaled, verbose=0).flatten()
